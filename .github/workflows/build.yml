@@ -53,3 +53,19 @@ jobs:
           git add -f dist/WhatsAppDesk-bridge.exe
           git commit -m "Build Windows exe" || true
           git push
+
+  windows-check:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: whatsapp-desk-build
+      - name: Parse and XAML-check widgets (Windows PowerShell 5.1)
+        shell: powershell
+        run: powershell -NoProfile -STA -ExecutionPolicy Bypass -File widgets\check.ps1
+      - name: Run bridge exe on real Windows
+        shell: powershell
+        run: |
+          Copy-Item dist\WhatsAppDesk-bridge.exe .
+          powershell -NoProfile -STA -ExecutionPolicy Bypass -File widgets\apitest.ps1
