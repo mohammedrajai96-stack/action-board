@@ -307,6 +307,9 @@ func saveMessage(acct *Account, evt *events.Message, countUnread bool, chatNameH
 	added, _ := res.RowsAffected()
 
 	name := chatNameHint
+	if isMasked(name) {
+		name = ""
+	}
 	if name == "" {
 		if info.Chat.Server == types.GroupServer {
 			name = groupTitle(acct.Client, info.Chat)
@@ -383,6 +386,10 @@ func attachHandler(acct *Account) {
 			acct.mu.Lock()
 			acct.Err = "This number was unlinked from the phone. Remove it and add it again."
 			acct.mu.Unlock()
+		case *events.Contact, *events.PushName, *events.AppStateSyncComplete:
+			nameCacheMu.Lock()
+			nameCache = map[string]string{}
+			nameCacheMu.Unlock()
 		case *events.Connected:
 			acct.mu.Lock()
 			acct.Err = ""
@@ -567,16 +574,88 @@ type chatRow struct {
 	Unread     int    `json:"unread"`
 }
 
-func displayChatName(name, chat string) string {
-	if strings.TrimSpace(name) != "" {
+// A name WhatsApp sent with dots/asterisks hiding digits is not a real name.
+func isMasked(name string) bool {
+	return strings.ContainsAny(name, "•·∙*●")
+}
+
+var (
+	nameCacheMu sync.Mutex
+	nameCache   = map[string]string{}
+)
+
+// resolvePerson turns a chat/sender address (phone-based or WhatsApp's hidden
+// "lid" id) into the best available name: saved contact name, then their own
+// WhatsApp name, then their phone number.
+func resolvePerson(accID, addr string) string {
+	key := accID + "|" + addr
+	nameCacheMu.Lock()
+	if n, ok := nameCache[key]; ok {
+		nameCacheMu.Unlock()
+		return n
+	}
+	nameCacheMu.Unlock()
+
+	jid, err := types.ParseJID(addr)
+	if err != nil {
+		return ""
+	}
+	a := findAccount(accID)
+	name := ""
+	if a != nil && a.Client != nil && a.Client.Store != nil {
+		c := a.Client
+		pn := jid
+		if jid.Server == types.HiddenUserServer && c.Store.LIDs != nil {
+			if p, err := c.Store.LIDs.GetPNForLID(ctx, jid); err == nil && !p.IsEmpty() {
+				pn = p
+			}
+		}
+		name = contactName(c, pn)
+		if name == "" && pn != jid {
+			name = contactName(c, jid)
+		}
+		if name == "" && pn.Server == types.DefaultUserServer {
+			name = "+" + pn.User
+		}
+	}
+	if name == "" && jid.Server == types.DefaultUserServer {
+		name = "+" + jid.User
+	}
+	if name != "" {
+		nameCacheMu.Lock()
+		nameCache[key] = name
+		nameCacheMu.Unlock()
+	}
+	return name
+}
+
+func displayChatName(accID, name, chat string) string {
+	jid, err := types.ParseJID(chat)
+	if err == nil && jid.Server == types.GroupServer {
+		if strings.TrimSpace(name) != "" {
+			return name
+		}
+		if a := findAccount(accID); a != nil && a.Client != nil {
+			if g := groupTitle(a.Client, jid); g != "" {
+				return g
+			}
+		}
+		return "Group"
+	}
+	if strings.TrimSpace(name) != "" && !isMasked(name) && !strings.HasPrefix(name, "+") {
 		return name
 	}
-	jid, err := types.ParseJID(chat)
-	if err == nil && jid.Server == types.DefaultUserServer {
-		return "+" + jid.User
+	if n := resolvePerson(accID, chat); n != "" {
+		// a real contact name beats a bare number we may have stored earlier
+		if !strings.HasPrefix(n, "+") || strings.TrimSpace(name) == "" || isMasked(name) {
+			return n
+		}
 	}
-	if err == nil && jid.Server == types.GroupServer {
-		return "Group"
+	if strings.TrimSpace(name) != "" && !isMasked(name) {
+		return name
+	}
+	if strings.TrimSpace(name) != "" {
+		return name
 	}
 	return "Unknown contact"
 }
@@ -588,7 +667,7 @@ func handleChats(w http.ResponseWriter, r *http.Request) {
 	}
 	rows, err := msgDB.Query(`
 		SELECT c.account, c.chat, COALESCE(c.name, ''), c.last_ts, c.unread,
-		       COALESCE(m.body, ''), COALESCE(m.from_me, 0), COALESCE(m.sender_name, '')
+		       COALESCE(m.body, ''), COALESCE(m.from_me, 0), COALESCE(m.sender_name, ''), COALESCE(m.sender, '')
 		  FROM chats c
 		  LEFT JOIN messages m ON m.rowid = (
 		       SELECT rowid FROM messages x WHERE x.account = c.account AND x.chat = c.chat ORDER BY ts DESC LIMIT 1)
@@ -602,12 +681,18 @@ func handleChats(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var c chatRow
 		var fromMe int
-		if err := rows.Scan(&c.Account, &c.Chat, &c.Name, &c.LastTs, &c.Unread, &c.LastText, &fromMe, &c.LastSender); err != nil {
+		var senderAddr string
+		if err := rows.Scan(&c.Account, &c.Chat, &c.Name, &c.LastTs, &c.Unread, &c.LastText, &fromMe, &c.LastSender, &senderAddr); err != nil {
 			continue
 		}
 		c.LastFromMe = fromMe == 1
 		c.IsGroup = strings.HasSuffix(c.Chat, "@g.us")
-		c.Name = displayChatName(c.Name, c.Chat)
+		c.Name = displayChatName(c.Account, c.Name, c.Chat)
+		if c.IsGroup && !c.LastFromMe && senderAddr != "" && (c.LastSender == "" || isMasked(c.LastSender)) {
+			if n := resolvePerson(c.Account, senderAddr); n != "" {
+				c.LastSender = n
+			}
+		}
 		out = append(out, c)
 	}
 	writeJSON(w, map[string]any{"chats": out})
@@ -627,7 +712,8 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 500 {
 		limit = 80
 	}
-	rows, err := msgDB.Query(`SELECT id, from_me, COALESCE(sender_name, ''), ts, COALESCE(body, '')
+	accID := q.Get("account")
+	rows, err := msgDB.Query(`SELECT id, from_me, COALESCE(sender_name, ''), ts, COALESCE(body, ''), COALESCE(sender, '')
 		FROM messages WHERE account = ? AND chat = ? ORDER BY ts DESC LIMIT ?`, q.Get("account"), q.Get("chat"), limit)
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -638,10 +724,16 @@ func handleMessages(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var m msgRow
 		var fromMe int
-		if err := rows.Scan(&m.ID, &fromMe, &m.SenderName, &m.Ts, &m.Body); err != nil {
+		var senderAddr string
+		if err := rows.Scan(&m.ID, &fromMe, &m.SenderName, &m.Ts, &m.Body, &senderAddr); err != nil {
 			continue
 		}
 		m.FromMe = fromMe == 1
+		if !m.FromMe && senderAddr != "" {
+			if n := resolvePerson(accID, senderAddr); n != "" && (m.SenderName == "" || isMasked(m.SenderName) || !strings.HasPrefix(n, "+")) {
+				m.SenderName = n
+			}
+		}
 		out = append(out, m)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Ts < out[j].Ts })
