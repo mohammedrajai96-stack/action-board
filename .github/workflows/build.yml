@@ -1,0 +1,43 @@
+name: build
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: false
+      - name: Resolve modules
+        run: |
+          if [ ! -f go.mod ]; then go mod init whatsappdesk; fi
+          go get go.mau.fi/whatsmeow@latest github.com/skip2/go-qrcode@latest modernc.org/sqlite@latest google.golang.org/protobuf@latest
+          go mod tidy
+      - name: Vet
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+      - name: Build Windows exe
+        run: GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -H windowsgui" -o WhatsAppDesk-bridge.exe .
+      - name: Smoke test on Linux
+        run: |
+          CGO_ENABLED=0 go build -o bridge-linux .
+          mkdir -p /tmp/appdata && APPDATA=/tmp/appdata ./bridge-linux &
+          sleep 4
+          TOKEN=$(cat /tmp/appdata/WhatsAppDesk/token.txt)
+          curl -sf -H "X-Token: $TOKEN" http://127.0.0.1:47321/api/status
+          echo
+          curl -sf -H "X-Token: $TOKEN" http://127.0.0.1:47321/api/chats
+          echo
+          curl -sf -X POST -H "X-Token: $TOKEN" http://127.0.0.1:47321/api/accounts/add
+          echo
+          sleep 6
+          curl -sf -H "X-Token: $TOKEN" http://127.0.0.1:47321/api/status
+          echo
+          curl -sf -o qr.png -w "QR http %{http_code} size %{size_download}\n" -H "X-Token: $TOKEN" "http://127.0.0.1:47321/api/accounts/qr?id=new-1"
+          cat /tmp/appdata/WhatsAppDesk/bridge.log || true
+      - uses: actions/upload-artifact@v4
+        with:
+          name: WhatsAppDesk-bridge
+          path: WhatsAppDesk-bridge.exe
